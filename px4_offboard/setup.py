@@ -31,7 +31,8 @@ setup(
                 'visualizer = px4_offboard.visualizer:main',
                 'velocity_control = px4_offboard.velocity_control:main',
                 'control = px4_offboard.control:main',
-                'processes = px4_offboard.processes:main'
+                'processes = px4_offboard.processes:main',
+                'PA_velocity_control = px4_offboard.PA_velocity_control:main',
         ],
     },
 )
