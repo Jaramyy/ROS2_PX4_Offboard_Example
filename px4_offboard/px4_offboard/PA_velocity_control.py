@@ -182,7 +182,7 @@ class OffboardControl(Node):
         # period is arbitrary, just should be more than 2Hz. Because live controls rely on this, a higher frequency is recommended
         # commands in cmdloop_callback won't be executed if the vehicle is not in offboard mode
         timer_period = 0.02  # seconds
-        self.timer = self.create_timer(timer_period, self.cmdloop_callback)
+        # self.timer = self.create_timer(timer_period, self.cmdloop_callback)
 
         self.nav_state = VehicleStatus.NAVIGATION_STATE_MAX
         self.arm_state = VehicleStatus.ARMING_STATE_ARMED
@@ -276,7 +276,7 @@ class OffboardControl(Node):
 
     # Takes off the vehicle to a user specified altitude (meters)
     def take_off(self):
-        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF, param1 = 1.0, param7=5.0) # param7 is altitude in meters
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF, param1 = 1.0, param7=2.0) # param7 is altitude in meters
         self.get_logger().info("Takeoff command send")
 
     #publishes command to /fmu/in/vehicle_command
@@ -358,7 +358,7 @@ class OffboardControl(Node):
         ang_vel = self.robot_state[:, 3:6]
         position = self.robot_state[:, 6:9]
         quaternion = self.robot_state[:, 9:13]
-        desired_pos_b = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+        desired_pos_b = torch.ones((1, 3), dtype=torch.float32, device=self.device) * 2.0
     
         dist_2d = torch.zeros((1, 1), dtype=torch.float32, device=self.device)
         dist_z = torch.zeros((1, 1), dtype=torch.float32, device=self.device)
@@ -391,18 +391,13 @@ class OffboardControl(Node):
     def PA_controller_callback(self):
         input_data = self.prepare_PA_input()
         output = self.PA_inference.predict(input_data.cpu().numpy())
-        self.velocity.x = float(output[0, 0])
-        self.velocity.y = float(output[0, 1])
-        self.velocity.z = float(output[0, 2])
-        self.yaw = float(output[0, 3])
+        self.velocity.x = float(output[0, 0]) * 3.0
+        self.velocity.y = float(output[0, 1]) * 3.0
+        self.velocity.z = float(output[0, 2]) * -3.0
+        self.yaw = float(output[0, 3]) * 6.28
 
         print(f"PA Velocity Command: vx: {self.velocity.x:.2f}, vy: {self.velocity.y:.2f}, vz: {self.velocity.z:.2f}, yaw_rate: {self.yaw:.2f}")
 
-                                
-        
-    #     return input_data
-    #publishes offboard control modes and velocity as trajectory setpoints
-    def cmdloop_callback(self):
         if(self.offboardMode == True):
             # Publish offboard control modes
             offboard_msg = OffboardControlMode()
@@ -413,16 +408,16 @@ class OffboardControl(Node):
             self.publisher_offboard_mode.publish(offboard_msg)            
 
             # Compute velocity in the world frame
-            cos_yaw = np.cos(self.trueYaw)
-            sin_yaw = np.sin(self.trueYaw)
-            velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
-            velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
+            # cos_yaw = np.cos(self.trueYaw)
+            # sin_yaw = np.sin(self.trueYaw)
+            # velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+            # velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
 
             # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
             trajectory_msg = TrajectorySetpoint()
             trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-            trajectory_msg.velocity[0] = velocity_world_x
-            trajectory_msg.velocity[1] = velocity_world_y
+            trajectory_msg.velocity[0] = self.velocity.x
+            trajectory_msg.velocity[1] = self.velocity.y
             trajectory_msg.velocity[2] = self.velocity.z
             trajectory_msg.position[0] = float('nan')
             trajectory_msg.position[1] = float('nan')
@@ -434,6 +429,43 @@ class OffboardControl(Node):
             trajectory_msg.yawspeed = self.yaw
 
             self.publisher_trajectory.publish(trajectory_msg)
+
+                                
+        
+    #     return input_data
+    #publishes offboard control modes and velocity as trajectory setpoints
+    # def cmdloop_callback(self):
+    #     if(self.offboardMode == True):
+    #         # Publish offboard control modes
+    #         offboard_msg = OffboardControlMode()
+    #         offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+    #         offboard_msg.position = False
+    #         offboard_msg.velocity = True
+    #         offboard_msg.acceleration = False
+    #         self.publisher_offboard_mode.publish(offboard_msg)            
+
+    #         # Compute velocity in the world frame
+    #         cos_yaw = np.cos(self.trueYaw)
+    #         sin_yaw = np.sin(self.trueYaw)
+    #         velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+    #         velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
+
+    #         # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
+    #         trajectory_msg = TrajectorySetpoint()
+    #         trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+    #         trajectory_msg.velocity[0] = velocity_world_x
+    #         trajectory_msg.velocity[1] = velocity_world_y
+    #         trajectory_msg.velocity[2] = self.velocity.z
+    #         trajectory_msg.position[0] = float('nan')
+    #         trajectory_msg.position[1] = float('nan')
+    #         trajectory_msg.position[2] = float('nan')
+    #         trajectory_msg.acceleration[0] = float('nan')
+    #         trajectory_msg.acceleration[1] = float('nan')
+    #         trajectory_msg.acceleration[2] = float('nan')
+    #         trajectory_msg.yaw = float('nan')
+    #         trajectory_msg.yawspeed = self.yaw
+
+    #         self.publisher_trajectory.publish(trajectory_msg)
 
 
 def main(args=None):

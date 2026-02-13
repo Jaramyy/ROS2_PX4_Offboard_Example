@@ -70,8 +70,8 @@ def generate_launch_description():
         Node(
             package='px4_offboard',
             namespace='px4_offboard',
-            executable='velocity_control',
-            name='velocity'
+            executable='PA_velocity_control',
+            name='PA_velocity_control'
         ),
         Node(
             package='rviz2',
