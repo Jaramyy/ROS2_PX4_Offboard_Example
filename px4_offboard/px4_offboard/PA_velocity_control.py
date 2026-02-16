@@ -109,7 +109,8 @@ class PA_inference:
         with torch.no_grad():
             input_tensor = torch.tensor(input_data, dtype=torch.float32).to('cuda' if torch.cuda.is_available() else 'cpu')
             output = self.student_model(input_tensor)
-        return output.cpu().detach().numpy()
+        # return output.cpu().detach().numpy()
+        return output
 
 class OffboardControl(Node):
 
@@ -200,6 +201,7 @@ class OffboardControl(Node):
         self.PA_inference = PA_inference()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.robot_state = torch.zeros((1, 31), dtype=torch.float32, device=self.device)
+        self.Yaw = torch.zeros((1,), dtype=torch.float32, device=self.device)
 
         controled_loop_period = 0.05  # seconds
         self.PA_timer = self.create_timer(controled_loop_period, self.PA_controller_callback)
@@ -342,7 +344,18 @@ class OffboardControl(Node):
         pos = torch.as_tensor(msg.position, dtype=torch.float32, device=self.device )
         quat = torch.as_tensor(msg.q, dtype=torch.float32, device=self.device )
 
-        self.robot_state[0, 0:3] = lin
+        self.Yaw = -(torch.arctan2(2.0*(quat[3]*quat[0] + quat[1]*quat[2]), 
+                                  1.0 - 2.0*(quat[0]*quat[0] + quat[1]*quat[1])))
+        
+        local_lin = torch.zeros_like(lin)
+        local_lin[0] = lin[0] * torch.cos(self.Yaw) + lin[1] * torch.sin(self.Yaw)
+        local_lin[1] = -lin[0] * torch.sin(self.Yaw) + lin[1] * torch.cos(self.Yaw)
+        local_lin[2] = -lin[2]
+
+        # print("local_lin:", local_lin)
+
+
+        self.robot_state[0, 0:3] = local_lin
         self.robot_state[0, 3:6] = ang
         self.robot_state[0, 6:9] = pos
         self.robot_state[0, 9:13] = quat 
@@ -352,7 +365,92 @@ class OffboardControl(Node):
     def lidar_callback(self, msg):
         # Process LIDAR data here
         lidar_ranges = torch.tensor(msg.ranges, dtype=torch.float32, device=self.device).unsqueeze(0)
+    
+    def quat_inv(self, q: torch.Tensor) -> torch.Tensor:
+        """
+        Quaternion inverse for (w, x, y, z) format.
+        Shape: (..., 4)
+        """
+        q = q / q.norm(dim=-1, keepdim=True)
+        w = q[..., 0:1]
+        xyz = -q[..., 1:]
+        return torch.cat((w, xyz), dim=-1)
 
+
+    def quat_mul(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """
+        Quaternion multiplication (w, x, y, z).
+        Shape: (..., 4)
+        """
+        w1, x1, y1, z1 = q1.unbind(-1)
+        w2, x2, y2, z2 = q2.unbind(-1)
+
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+
+        return torch.stack((w, x, y, z), dim=-1)
+
+
+    def quat_apply(self, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Rotate vector v by quaternion q.
+        q: (..., 4)  (w, x, y, z)
+        v: (..., 3)
+        """
+        q = q / q.norm(dim=-1, keepdim=True)
+
+        w = q[..., 0:1]
+        xyz = q[..., 1:]
+
+        t = 2.0 * torch.cross(xyz, v, dim=-1)
+        return v + w * t + torch.cross(xyz, t, dim=-1)
+
+
+    def subtract_frame_transforms(
+        self,
+        t01: torch.Tensor,
+        q01: torch.Tensor,
+        t02: torch.Tensor | None = None,
+        q02: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute T12 = T01^{-1} * T02
+
+        Args:
+            t01: (N, 3) position of frame 1 w.r.t frame 0
+            q01: (N, 4) quaternion (w, x, y, z) of frame 1 w.r.t frame 0
+            t02: (N, 3) position of frame 2 w.r.t frame 0
+            q02: (N, 4) quaternion of frame 2 w.r.t frame 0
+
+        Returns:
+            t12: (N, 3) position of frame 2 w.r.t frame 1
+            q12: (N, 4) quaternion of frame 2 w.r.t frame 1
+        """
+
+        # Ensure normalization
+        q01 = q01 / q01.norm(dim=-1, keepdim=True)
+
+        # Invert first transform
+        q10 = self.quat_inv(q01)
+
+        # Orientation
+        if q02 is not None:
+            q02 = q02 / q02.norm(dim=-1, keepdim=True)
+            q12 = self.quat_mul(q10, q02)
+        else:
+            q12 = q10
+
+        # Translation
+        if t02 is not None:
+            delta = t02 - t01
+            t12 = self.quat_apply(q10, delta)
+        else:
+            t12 = self.quat_apply(q10, -t01)
+
+        return t12, q12
+    
     def prepare_PA_input(self):
         lin_vel = self.robot_state[:, 0:3]
         ang_vel = self.robot_state[:, 3:6]
@@ -363,10 +461,31 @@ class OffboardControl(Node):
         dist_2d = torch.zeros((1, 1), dtype=torch.float32, device=self.device)
         dist_z = torch.zeros((1, 1), dtype=torch.float32, device=self.device)
 
-        desired_dist = desired_pos_b - position
+        local_position = torch.zeros_like(position)
+        local_position[0, 0] = position[0, 0] * torch.cos(self.Yaw) + position[0, 1] * torch.sin(self.Yaw)
+        local_position[0, 1] = -position[0, 0] * torch.sin(self.Yaw) + position[0, 1] * torch.cos(self.Yaw)
+        local_position[0, 2] = -position[0, 2]
+
+        # delta_w = desired_pos_b - local_position
+        # delta_b = self.quat_rotate_inverse(quaternion, delta_w)
+        # unit_dir = delta_b / (delta_b.norm(dim=-1, keepdim=True) + 1e-6)
+        
+        delta_w, _ = self.subtract_frame_transforms(
+            position,
+            quaternion,
+            desired_pos_b,
+            None
+        )
+
+        unit_dir = delta_w / (delta_w.norm(dim=-1, keepdim=True) + 1e-6)
+        # desired_dist = desired_pos_b - local_position
+        # unit_desired_dist = desired_dist / (torch.norm(desired_dist) + 1e-6)
+
+        
+
         # print("Desired Pos B:", desired_dist)
-        dist_2d[0, 0] = torch.sqrt(desired_dist[0, 0]**2 + desired_dist[0, 1]**2)
-        dist_z[0, 0] = desired_dist[0, 2]
+        dist_2d[0, 0] = torch.sqrt(delta_w[0, 0]**2 + delta_w[0, 1]**2)
+        dist_z[0, 0] = delta_w[0, 2]
 
         mock_lidar_data = torch.full(
             (1, 20),
@@ -374,11 +493,16 @@ class OffboardControl(Node):
             dtype=torch.float32,
             device=self.device
         )
+        print("lin_vel:", lin_vel)
+        print("ang_vel:", ang_vel)
+        print("unit_dir:", unit_dir)
+        print("dist_2d:", dist_2d)
+        print("dist_z:", dist_z)
 
         input_data = torch.cat([
             lin_vel,
             ang_vel,
-            desired_pos_b,
+            unit_dir,
             dist_2d,
             dist_z,
             mock_lidar_data
@@ -388,55 +512,30 @@ class OffboardControl(Node):
 
         return input_data
     
-    def PA_controller_callback(self):
-        input_data = self.prepare_PA_input()
-        output = self.PA_inference.predict(input_data.cpu().numpy())
-        self.velocity.x = float(output[0, 0]) * 3.0
-        self.velocity.y = float(output[0, 1]) * 3.0
-        self.velocity.z = float(output[0, 2]) * -3.0
-        self.yaw = float(output[0, 3]) * 6.28
+    # def PA_controller_callback(self):
 
-        print(f"PA Velocity Command: vx: {self.velocity.x:.2f}, vy: {self.velocity.y:.2f}, vz: {self.velocity.z:.2f}, yaw_rate: {self.yaw:.2f}")
-
-        if(self.offboardMode == True):
-            # Publish offboard control modes
-            offboard_msg = OffboardControlMode()
-            offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-            offboard_msg.position = False
-            offboard_msg.velocity = True
-            offboard_msg.acceleration = False
-            self.publisher_offboard_mode.publish(offboard_msg)            
-
-            # Compute velocity in the world frame
-            # cos_yaw = np.cos(self.trueYaw)
-            # sin_yaw = np.sin(self.trueYaw)
-            # velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
-            # velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
-
-            # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
-            trajectory_msg = TrajectorySetpoint()
-            trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-            trajectory_msg.velocity[0] = self.velocity.x
-            trajectory_msg.velocity[1] = self.velocity.y
-            trajectory_msg.velocity[2] = self.velocity.z
-            trajectory_msg.position[0] = float('nan')
-            trajectory_msg.position[1] = float('nan')
-            trajectory_msg.position[2] = float('nan')
-            trajectory_msg.acceleration[0] = float('nan')
-            trajectory_msg.acceleration[1] = float('nan')
-            trajectory_msg.acceleration[2] = float('nan')
-            trajectory_msg.yaw = float('nan')
-            trajectory_msg.yawspeed = self.yaw
-
-            self.publisher_trajectory.publish(trajectory_msg)
-
-                                
-        
-    #     return input_data
-    #publishes offboard control modes and velocity as trajectory setpoints
-    # def cmdloop_callback(self):
     #     if(self.offboardMode == True):
     #         # Publish offboard control modes
+    #         input_data = self.prepare_PA_input()
+    #         # print("Input Data:", input_data.device, input_data.shape)
+    #         output = self.PA_inference.predict(input_data)
+
+    #         # fake output for testing
+    #         # output = torch.tensor([[0.0, 0.0, 0.5, 0.0]], dtype=torch.float32, device=self.device)
+
+    #         global_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+    #         global_vel[0, 0] = output[0, 0] * torch.cos(self.Yaw) - output[0, 1] * torch.sin(self.Yaw)
+    #         global_vel[0, 1] = output[0, 0] * torch.sin(self.Yaw) + output[0, 1] * torch.cos(self.Yaw)
+    #         global_vel[0, 2] = output[0, 2]
+
+    #         self.velocity.x = float(global_vel[0, 0]) * 3.0
+    #         self.velocity.y = float(global_vel[0, 1]) * 3.0
+    #         self.velocity.z = float(global_vel[0, 2]) * -3.0
+    #         self.yaw = float(output[0, 3]) * 6.28
+
+    #         print(f"PA Velocity Command: vx: {self.velocity.x:.2f}, vy: {self.velocity.y:.2f}, vz: {self.velocity.z:.2f}, yaw_rate: {self.yaw:.2f}")
+
+
     #         offboard_msg = OffboardControlMode()
     #         offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
     #         offboard_msg.position = False
@@ -445,16 +544,16 @@ class OffboardControl(Node):
     #         self.publisher_offboard_mode.publish(offboard_msg)            
 
     #         # Compute velocity in the world frame
-    #         cos_yaw = np.cos(self.trueYaw)
-    #         sin_yaw = np.sin(self.trueYaw)
-    #         velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
-    #         velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
+    #         # cos_yaw = np.cos(self.trueYaw)
+    #         # sin_yaw = np.sin(self.trueYaw)
+    #         # velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+    #         # velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
 
     #         # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
     #         trajectory_msg = TrajectorySetpoint()
     #         trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-    #         trajectory_msg.velocity[0] = velocity_world_x
-    #         trajectory_msg.velocity[1] = velocity_world_y
+    #         trajectory_msg.velocity[0] = self.velocity.x
+    #         trajectory_msg.velocity[1] = self.velocity.y
     #         trajectory_msg.velocity[2] = self.velocity.z
     #         trajectory_msg.position[0] = float('nan')
     #         trajectory_msg.position[1] = float('nan')
@@ -466,6 +565,41 @@ class OffboardControl(Node):
     #         trajectory_msg.yawspeed = self.yaw
 
     #         self.publisher_trajectory.publish(trajectory_msg)
+
+                                
+    def PA_controller_callback(self):
+        if(self.offboardMode == True):
+            # Publish offboard control modes
+            input_data = self.prepare_PA_input()
+            offboard_msg = OffboardControlMode()
+            offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+            offboard_msg.position = False
+            offboard_msg.velocity = True
+            offboard_msg.acceleration = False
+            self.publisher_offboard_mode.publish(offboard_msg)            
+
+            # Compute velocity in the world frame
+            cos_yaw = np.cos(self.trueYaw)
+            sin_yaw = np.sin(self.trueYaw)
+            velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+            velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
+
+            # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
+            trajectory_msg = TrajectorySetpoint()
+            trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+            trajectory_msg.velocity[0] = velocity_world_x
+            trajectory_msg.velocity[1] = velocity_world_y
+            trajectory_msg.velocity[2] = self.velocity.z
+            trajectory_msg.position[0] = float('nan')
+            trajectory_msg.position[1] = float('nan')
+            trajectory_msg.position[2] = float('nan')
+            trajectory_msg.acceleration[0] = float('nan')
+            trajectory_msg.acceleration[1] = float('nan')
+            trajectory_msg.acceleration[2] = float('nan')
+            trajectory_msg.yaw = float('nan')
+            trajectory_msg.yawspeed = self.yaw
+
+            self.publisher_trajectory.publish(trajectory_msg)
 
 
 def main(args=None):

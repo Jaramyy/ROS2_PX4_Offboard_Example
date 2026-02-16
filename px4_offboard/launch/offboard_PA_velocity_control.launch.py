@@ -67,12 +67,12 @@ def generate_launch_description():
             name='control',
             prefix='gnome-terminal --',
         ),
-        Node(
-            package='px4_offboard',
-            namespace='px4_offboard',
-            executable='velocity_control',
-            name='velocity_control'
-        ),
+        # Node(
+        #     package='px4_offboard',
+        #     namespace='px4_offboard',
+        #     executable='PA_velocity_control',
+        #     name='PA_velocity_control'
+        # ),
         Node(
             package='rviz2',
             namespace='',
