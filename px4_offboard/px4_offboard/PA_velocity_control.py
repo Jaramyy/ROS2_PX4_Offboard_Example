@@ -366,6 +366,20 @@ class OffboardControl(Node):
         # Process LIDAR data here
         lidar_ranges = torch.tensor(msg.ranges, dtype=torch.float32, device=self.device).unsqueeze(0)
     
+    
+    def quat_rotate_inverse(self, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Rotate vector v by the inverse of quaternion q.
+        q: (..., 4)  (w, x, y, z)
+        v: (..., 3)
+        """
+        q = q / q.norm(dim=-1, keepdim=True)
+
+        w = q[..., 0:1]
+        xyz = q[..., 1:]
+
+        t = 2.0 * torch.cross(xyz, v, dim=-1)
+        return v - w * t + torch.cross(xyz, t, dim=-1)
     def quat_inv(self, q: torch.Tensor) -> torch.Tensor:
         """
         Quaternion inverse for (w, x, y, z) format.
@@ -456,7 +470,10 @@ class OffboardControl(Node):
         ang_vel = self.robot_state[:, 3:6]
         position = self.robot_state[:, 6:9]
         quaternion = self.robot_state[:, 9:13]
-        desired_pos_b = torch.ones((1, 3), dtype=torch.float32, device=self.device) * 2.0
+        desired_pos_b = torch.ones((1, 3), dtype=torch.float32, device=self.device) 
+        desired_pos_b[0, 0] = 3.0
+        desired_pos_b[0, 1] = 0.0
+        desired_pos_b[0, 2] = 3.0
     
         dist_2d = torch.zeros((1, 1), dtype=torch.float32, device=self.device)
         dist_z = torch.zeros((1, 1), dtype=torch.float32, device=self.device)
@@ -466,16 +483,16 @@ class OffboardControl(Node):
         local_position[0, 1] = -position[0, 0] * torch.sin(self.Yaw) + position[0, 1] * torch.cos(self.Yaw)
         local_position[0, 2] = -position[0, 2]
 
-        # delta_w = desired_pos_b - local_position
-        # delta_b = self.quat_rotate_inverse(quaternion, delta_w)
-        # unit_dir = delta_b / (delta_b.norm(dim=-1, keepdim=True) + 1e-6)
+        delta_w = desired_pos_b - local_position
+        delta_b = self.quat_rotate_inverse(quaternion, delta_w)
+        unit_dir = delta_b / (delta_b.norm(dim=-1, keepdim=True) + 1e-6)
         
-        delta_w, _ = self.subtract_frame_transforms(
-            position,
-            quaternion,
-            desired_pos_b,
-            None
-        )
+        # delta_w, _ = self.subtract_frame_transforms(
+        #     position,
+        #     quaternion,
+        #     desired_pos_b,
+        #     None
+        # )
 
         unit_dir = delta_w / (delta_w.norm(dim=-1, keepdim=True) + 1e-6)
         # desired_dist = desired_pos_b - local_position
@@ -512,65 +529,36 @@ class OffboardControl(Node):
 
         return input_data
     
-    # def PA_controller_callback(self):
-
-    #     if(self.offboardMode == True):
-    #         # Publish offboard control modes
-    #         input_data = self.prepare_PA_input()
-    #         # print("Input Data:", input_data.device, input_data.shape)
-    #         output = self.PA_inference.predict(input_data)
-
-    #         # fake output for testing
-    #         # output = torch.tensor([[0.0, 0.0, 0.5, 0.0]], dtype=torch.float32, device=self.device)
-
-    #         global_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
-    #         global_vel[0, 0] = output[0, 0] * torch.cos(self.Yaw) - output[0, 1] * torch.sin(self.Yaw)
-    #         global_vel[0, 1] = output[0, 0] * torch.sin(self.Yaw) + output[0, 1] * torch.cos(self.Yaw)
-    #         global_vel[0, 2] = output[0, 2]
-
-    #         self.velocity.x = float(global_vel[0, 0]) * 3.0
-    #         self.velocity.y = float(global_vel[0, 1]) * 3.0
-    #         self.velocity.z = float(global_vel[0, 2]) * -3.0
-    #         self.yaw = float(output[0, 3]) * 6.28
-
-    #         print(f"PA Velocity Command: vx: {self.velocity.x:.2f}, vy: {self.velocity.y:.2f}, vz: {self.velocity.z:.2f}, yaw_rate: {self.yaw:.2f}")
-
-
-    #         offboard_msg = OffboardControlMode()
-    #         offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-    #         offboard_msg.position = False
-    #         offboard_msg.velocity = True
-    #         offboard_msg.acceleration = False
-    #         self.publisher_offboard_mode.publish(offboard_msg)            
-
-    #         # Compute velocity in the world frame
-    #         # cos_yaw = np.cos(self.trueYaw)
-    #         # sin_yaw = np.sin(self.trueYaw)
-    #         # velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
-    #         # velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
-
-    #         # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
-    #         trajectory_msg = TrajectorySetpoint()
-    #         trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-    #         trajectory_msg.velocity[0] = self.velocity.x
-    #         trajectory_msg.velocity[1] = self.velocity.y
-    #         trajectory_msg.velocity[2] = self.velocity.z
-    #         trajectory_msg.position[0] = float('nan')
-    #         trajectory_msg.position[1] = float('nan')
-    #         trajectory_msg.position[2] = float('nan')
-    #         trajectory_msg.acceleration[0] = float('nan')
-    #         trajectory_msg.acceleration[1] = float('nan')
-    #         trajectory_msg.acceleration[2] = float('nan')
-    #         trajectory_msg.yaw = float('nan')
-    #         trajectory_msg.yawspeed = self.yaw
-
-    #         self.publisher_trajectory.publish(trajectory_msg)
-
-                                
     def PA_controller_callback(self):
+
         if(self.offboardMode == True):
             # Publish offboard control modes
             input_data = self.prepare_PA_input()
+            # print("Input Data:", input_data.device, input_data.shape)
+            output = self.PA_inference.predict(input_data)
+            output = output.clone().clamp(-1.0, 1.0)  # Ensure outputs are in the range [-1, 1]
+            
+            output[0, 0] = output[0, 0] * 6.28  # yaw rate
+            output[0, 1] = output[0, 1] * 3.0   # velocity x
+            output[0, 2] = output[0, 2] * 3.0   # velocity y
+            output[0, 3] = output[0, 3] * -3.0  # velocity z (negative because of NED to FLU transformation in odom callback)
+            # fake output for testing
+            # output = torch.tensor([[0.0, 0.0, 0.5, 0.0]], dtype=torch.float32, device=self.device)
+
+            global_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+            global_vel[0, 0] = output[0, 1] * torch.cos(self.Yaw) - output[0, 2] * torch.sin(self.Yaw)
+            global_vel[0, 1] = output[0, 1] * torch.sin(self.Yaw) + output[0, 2] * torch.cos(self.Yaw)
+            global_vel[0, 2] = output[0, 3]
+
+
+            self.velocity.x = float(global_vel[0, 0]) 
+            self.velocity.y = float(global_vel[0, 1]) 
+            self.velocity.z = float(global_vel[0, 2])
+            self.yaw = float(output[0, 0])
+
+            print(f"PA Velocity Command: vx: {self.velocity.x:.2f}, vy: {self.velocity.y:.2f}, vz: {self.velocity.z:.2f}, yaw_rate: {self.yaw:.2f}")
+
+
             offboard_msg = OffboardControlMode()
             offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
             offboard_msg.position = False
@@ -579,16 +567,16 @@ class OffboardControl(Node):
             self.publisher_offboard_mode.publish(offboard_msg)            
 
             # Compute velocity in the world frame
-            cos_yaw = np.cos(self.trueYaw)
-            sin_yaw = np.sin(self.trueYaw)
-            velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
-            velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
+            # cos_yaw = np.cos(self.trueYaw)
+            # sin_yaw = np.sin(self.trueYaw)
+            # velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+            # velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
 
             # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
             trajectory_msg = TrajectorySetpoint()
             trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-            trajectory_msg.velocity[0] = velocity_world_x
-            trajectory_msg.velocity[1] = velocity_world_y
+            trajectory_msg.velocity[0] = self.velocity.x
+            trajectory_msg.velocity[1] = self.velocity.y
             trajectory_msg.velocity[2] = self.velocity.z
             trajectory_msg.position[0] = float('nan')
             trajectory_msg.position[1] = float('nan')
@@ -600,6 +588,41 @@ class OffboardControl(Node):
             trajectory_msg.yawspeed = self.yaw
 
             self.publisher_trajectory.publish(trajectory_msg)
+
+                                
+    # def PA_controller_callback(self):
+    #     if(self.offboardMode == True):
+    #         # Publish offboard control modes
+    #         input_data = self.prepare_PA_input()
+    #         offboard_msg = OffboardControlMode()
+    #         offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+    #         offboard_msg.position = False
+    #         offboard_msg.velocity = True
+    #         offboard_msg.acceleration = False
+    #         self.publisher_offboard_mode.publish(offboard_msg)            
+
+    #         # Compute velocity in the world frame
+    #         cos_yaw = np.cos(self.trueYaw)
+    #         sin_yaw = np.sin(self.trueYaw)
+    #         velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+    #         velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
+
+    #         # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
+    #         trajectory_msg = TrajectorySetpoint()
+    #         trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+    #         trajectory_msg.velocity[0] = velocity_world_x
+    #         trajectory_msg.velocity[1] = velocity_world_y
+    #         trajectory_msg.velocity[2] = self.velocity.z
+    #         trajectory_msg.position[0] = float('nan')
+    #         trajectory_msg.position[1] = float('nan')
+    #         trajectory_msg.position[2] = float('nan')
+    #         trajectory_msg.acceleration[0] = float('nan')
+    #         trajectory_msg.acceleration[1] = float('nan')
+    #         trajectory_msg.acceleration[2] = float('nan')
+    #         trajectory_msg.yaw = float('nan')
+    #         trajectory_msg.yawspeed = self.yaw
+
+    #         self.publisher_trajectory.publish(trajectory_msg)
 
 
 def main(args=None):
