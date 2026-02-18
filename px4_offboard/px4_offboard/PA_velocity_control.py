@@ -205,6 +205,7 @@ class OffboardControl(Node):
 
         controled_loop_period = 0.05  # seconds
         self.PA_timer = self.create_timer(controled_loop_period, self.PA_controller_callback)
+        self.velocity_cmd = Vector3()
 
 
     def arm_message_callback(self, msg):
@@ -352,6 +353,9 @@ class OffboardControl(Node):
         local_lin[1] = -lin[0] * torch.sin(self.Yaw) + lin[1] * torch.cos(self.Yaw)
         local_lin[2] = -lin[2]
 
+        
+        # print("Position:", pos)
+
         # print("local_lin:", local_lin)
 
 
@@ -380,89 +384,119 @@ class OffboardControl(Node):
 
         t = 2.0 * torch.cross(xyz, v, dim=-1)
         return v - w * t + torch.cross(xyz, t, dim=-1)
-    def quat_inv(self, q: torch.Tensor) -> torch.Tensor:
-        """
-        Quaternion inverse for (w, x, y, z) format.
-        Shape: (..., 4)
-        """
-        q = q / q.norm(dim=-1, keepdim=True)
-        w = q[..., 0:1]
-        xyz = -q[..., 1:]
-        return torch.cat((w, xyz), dim=-1)
-
-
-    def quat_mul(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-        """
-        Quaternion multiplication (w, x, y, z).
-        Shape: (..., 4)
-        """
-        w1, x1, y1, z1 = q1.unbind(-1)
-        w2, x2, y2, z2 = q2.unbind(-1)
-
-        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-
-        return torch.stack((w, x, y, z), dim=-1)
-
-
-    def quat_apply(self, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """
-        Rotate vector v by quaternion q.
-        q: (..., 4)  (w, x, y, z)
-        v: (..., 3)
-        """
-        q = q / q.norm(dim=-1, keepdim=True)
-
-        w = q[..., 0:1]
-        xyz = q[..., 1:]
-
-        t = 2.0 * torch.cross(xyz, v, dim=-1)
-        return v + w * t + torch.cross(xyz, t, dim=-1)
-
-
-    def subtract_frame_transforms(
-        self,
-        t01: torch.Tensor,
-        q01: torch.Tensor,
-        t02: torch.Tensor | None = None,
-        q02: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute T12 = T01^{-1} * T02
+    
+    def quat_conjugate(self, q: torch.Tensor) -> torch.Tensor:
+        """Computes the conjugate of a quaternion.
 
         Args:
-            t01: (N, 3) position of frame 1 w.r.t frame 0
-            q01: (N, 4) quaternion (w, x, y, z) of frame 1 w.r.t frame 0
-            t02: (N, 3) position of frame 2 w.r.t frame 0
-            q02: (N, 4) quaternion of frame 2 w.r.t frame 0
+            q: The quaternion orientation in (w, x, y, z). Shape is (..., 4).
 
         Returns:
-            t12: (N, 3) position of frame 2 w.r.t frame 1
-            q12: (N, 4) quaternion of frame 2 w.r.t frame 1
+            The conjugate quaternion in (w, x, y, z). Shape is (..., 4).
         """
+        shape = q.shape
+        q = q.reshape(-1, 4)
+        return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1).view(shape)
+    def quat_inv(self, q: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+        """Computes the inverse of a quaternion.
 
-        # Ensure normalization
-        q01 = q01 / q01.norm(dim=-1, keepdim=True)
+        Args:
+            q: The quaternion orientation in (w, x, y, z). Shape is (N, 4).
+            eps: A small value to avoid division by zero. Defaults to 1e-9.
 
-        # Invert first transform
+        Returns:
+            The inverse quaternion in (w, x, y, z). Shape is (N, 4).
+        """
+        return self.quat_conjugate(q) / q.pow(2).sum(dim=-1, keepdim=True).clamp(min=eps)
+    
+    def quat_mul(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Multiply two quaternions together.
+
+        Args:
+            q1: The first quaternion in (w, x, y, z). Shape is (..., 4).
+            q2: The second quaternion in (w, x, y, z). Shape is (..., 4).
+
+        Returns:
+            The product of the two quaternions in (w, x, y, z). Shape is (..., 4).
+
+        Raises:
+            ValueError: Input shapes of ``q1`` and ``q2`` are not matching.
+        """
+        # check input is correct
+        if q1.shape != q2.shape:
+            msg = f"Expected input quaternion shape mismatch: {q1.shape} != {q2.shape}."
+            raise ValueError(msg)
+        # reshape to (N, 4) for multiplication
+        shape = q1.shape
+        q1 = q1.reshape(-1, 4)
+        q2 = q2.reshape(-1, 4)
+        # extract components from quaternions
+        w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+        w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+        # perform multiplication
+        ww = (z1 + x1) * (x2 + y2)
+        yy = (w1 - y1) * (w2 + z2)
+        zz = (w1 + y1) * (w2 - z2)
+        xx = ww + yy + zz
+        qq = 0.5 * (xx + (z1 - x1) * (x2 - y2))
+        w = qq - ww + (z1 - y1) * (y2 - z2)
+        x = qq - xx + (x1 + w1) * (x2 + w2)
+        y = qq - yy + (w1 - x1) * (y2 + z2)
+        z = qq - zz + (z1 + y1) * (w2 - x2)
+
+        return torch.stack([w, x, y, z], dim=-1).view(shape)
+    
+    def quat_apply(self, quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        """Apply a quaternion rotation to a vector.
+
+        Args:
+            quat: The quaternion in (w, x, y, z). Shape is (..., 4).
+            vec: The vector in (x, y, z). Shape is (..., 3).
+
+        Returns:
+            The rotated vector in (x, y, z). Shape is (..., 3).
+        """
+        # store shape
+        shape = vec.shape
+        # reshape to (N, 3) for multiplication
+        quat = quat.reshape(-1, 4)
+        vec = vec.reshape(-1, 3)
+        # extract components from quaternions
+        xyz = quat[:, 1:]
+        t = xyz.cross(vec, dim=-1) * 2
+        return (vec + quat[:, 0:1] * t + xyz.cross(t, dim=-1)).view(shape)
+
+    def subtract_frame_transforms(
+        self, t01: torch.Tensor, q01: torch.Tensor, t02: torch.Tensor | None = None, q02: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""Subtract transformations between two reference frames into a stationary frame.
+
+        It performs the following transformation operation: :math:`T_{12} = T_{01}^{-1} \times T_{02}`,
+        where :math:`T_{AB}` is the homogeneous transformation matrix from frame A to B.
+
+        Args:
+            t01: Position of frame 1 w.r.t. frame 0. Shape is (N, 3).
+            q01: Quaternion orientation of frame 1 w.r.t. frame 0 in (w, x, y, z). Shape is (N, 4).
+            t02: Position of frame 2 w.r.t. frame 0. Shape is (N, 3).
+                Defaults to None, in which case the position is assumed to be zero.
+            q02: Quaternion orientation of frame 2 w.r.t. frame 0 in (w, x, y, z). Shape is (N, 4).
+                Defaults to None, in which case the orientation is assumed to be identity.
+
+        Returns:
+            A tuple containing the position and orientation of frame 2 w.r.t. frame 1.
+            Shape of the tensors are (N, 3) and (N, 4) respectively.
+        """
+        # compute orientation
         q10 = self.quat_inv(q01)
-
-        # Orientation
         if q02 is not None:
-            q02 = q02 / q02.norm(dim=-1, keepdim=True)
             q12 = self.quat_mul(q10, q02)
         else:
             q12 = q10
-
-        # Translation
+        # compute translation
         if t02 is not None:
-            delta = t02 - t01
-            t12 = self.quat_apply(q10, delta)
+            t12 = self.quat_apply(q10, t02 - t01)
         else:
             t12 = self.quat_apply(q10, -t01)
-
         return t12, q12
     
     def prepare_PA_input(self):
@@ -483,16 +517,33 @@ class OffboardControl(Node):
         local_position[0, 1] = -position[0, 0] * torch.sin(self.Yaw) + position[0, 1] * torch.cos(self.Yaw)
         local_position[0, 2] = -position[0, 2]
 
-        delta_w = desired_pos_b - local_position
-        delta_b = self.quat_rotate_inverse(quaternion, delta_w)
-        unit_dir = delta_b / (delta_b.norm(dim=-1, keepdim=True) + 1e-6)
-        
-        # delta_w, _ = self.subtract_frame_transforms(
-        #     position,
-        #     quaternion,
-        #     desired_pos_b,
-        #     None
-        # )
+        # delta_w = desired_pos_b - local_position
+        # delta_b = self.quat_rotate_inverse(quaternion, delta_w)
+        # unit_dir = delta_b / (delta_b.norm(dim=-1, keepdim=True) + 1e-6)
+        edit_position = position.clone()
+        edit_position[0, 0] = position[0, 1]
+        edit_position[0, 1] = position[0, 0]
+        edit_position[0, 2] = -position[0, 2] - 2.0  
+
+        edit_quaternion = quaternion.clone()
+        edit_quaternion[0, 0] = quaternion[0, 3]
+        edit_quaternion[0, 1] = quaternion[0, 0]
+        edit_quaternion[0, 2] = quaternion[0, 1]
+        edit_quaternion[0, 3] = quaternion[0, 2]
+
+        edit_ang_vel = ang_vel.clone()
+        edit_ang_vel[0, 0] = -ang_vel[0, 1]
+        edit_ang_vel[0, 1] = -ang_vel[0, 0]
+        edit_ang_vel[0, 2] = ang_vel[0, 2]
+
+        # print("ang_vel:", ang_vel)
+
+        delta_w, _ = self.subtract_frame_transforms(
+            edit_position,
+            edit_quaternion,
+            desired_pos_b,
+            None
+        )
 
         unit_dir = delta_w / (delta_w.norm(dim=-1, keepdim=True) + 1e-6)
         # desired_dist = desired_pos_b - local_position
@@ -501,7 +552,7 @@ class OffboardControl(Node):
         
 
         # print("Desired Pos B:", desired_dist)
-        dist_2d[0, 0] = torch.sqrt(delta_w[0, 0]**2 + delta_w[0, 1]**2)
+        dist_2d[0, 0] = delta_w[0, :1].norm()
         dist_z[0, 0] = delta_w[0, 2]
 
         mock_lidar_data = torch.full(
@@ -510,15 +561,16 @@ class OffboardControl(Node):
             dtype=torch.float32,
             device=self.device
         )
-        print("lin_vel:", lin_vel)
-        print("ang_vel:", ang_vel)
+        # print("lin_vel:", lin_vel)
+        # print("ang_vel:", ang_vel)
+        # print("edit_ang_vel:", edit_ang_vel)
         print("unit_dir:", unit_dir)
         print("dist_2d:", dist_2d)
         print("dist_z:", dist_z)
 
         input_data = torch.cat([
             lin_vel,
-            ang_vel,
+            edit_ang_vel,
             unit_dir,
             dist_2d,
             dist_z,
@@ -536,24 +588,38 @@ class OffboardControl(Node):
             input_data = self.prepare_PA_input()
             # print("Input Data:", input_data.device, input_data.shape)
             output = self.PA_inference.predict(input_data)
-            output = output.clone().clamp(-1.0, 1.0)  # Ensure outputs are in the range [-1, 1]
-            
-            output[0, 0] = output[0, 0] * 6.28  # yaw rate
-            output[0, 1] = output[0, 1] * 3.0   # velocity x
-            output[0, 2] = output[0, 2] * 3.0   # velocity y
-            output[0, 3] = output[0, 3] * -3.0  # velocity z (negative because of NED to FLU transformation in odom callback)
-            # fake output for testing
-            # output = torch.tensor([[0.0, 0.0, 0.5, 0.0]], dtype=torch.float32, device=self.device)
+            model_output = output.clone().clamp(-1.0, 1.0)  # Ensure outputs are in the range [-1, 1]
 
+            # model_output[0, 0] = 0.0
+            # model_output[0, 1] = 0.
+            # model_output[0, 2] = 0.0
+            # model_output[0, 3] = 0.0
+
+            
+            output[0, 0] = model_output[0, 0] * 6.28  # yaw rate
+            self.velocity_cmd.x = float(model_output[0, 2] * -3.0)   # velocity x
+            self.velocity_cmd.y = float(model_output[0, 1] * 3.0)   # velocity y
+            self.velocity_cmd.z = float(model_output[0, 3] * -3.0)  # velocity z (negative because of NED to FLU transformation in odom callback)
+            # fake output for testing
+            
+
+
+            # global_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
             global_vel = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
-            global_vel[0, 0] = output[0, 1] * torch.cos(self.Yaw) - output[0, 2] * torch.sin(self.Yaw)
-            global_vel[0, 1] = output[0, 1] * torch.sin(self.Yaw) + output[0, 2] * torch.cos(self.Yaw)
-            global_vel[0, 2] = output[0, 3]
+            global_vel[0, 0] = self.velocity_cmd.x * torch.cos(self.Yaw) - self.velocity_cmd.y * torch.sin(self.Yaw)
+            global_vel[0, 1] = self.velocity_cmd.x * torch.sin(self.Yaw) + self.velocity_cmd.y * torch.cos(self.Yaw)
+            global_vel[0, 2] = self.velocity_cmd.z
+
+                #         # Compute velocity in the world frame
+    #         cos_yaw = np.cos(self.trueYaw)
+    #         sin_yaw = np.sin(self.trueYaw)
+    #         velocity_world_x = (self.velocity.x * cos_yaw - self.velocity.y * sin_yaw)
+    #         velocity_world_y = (self.velocity.x * sin_yaw + self.velocity.y * cos_yaw)
 
 
             self.velocity.x = float(global_vel[0, 0]) 
             self.velocity.y = float(global_vel[0, 1]) 
-            self.velocity.z = float(global_vel[0, 2])
+            self.velocity.z = float(global_vel[0, 2]) 
             self.yaw = float(output[0, 0])
 
             print(f"PA Velocity Command: vx: {self.velocity.x:.2f}, vy: {self.velocity.y:.2f}, vz: {self.velocity.z:.2f}, yaw_rate: {self.yaw:.2f}")
@@ -575,8 +641,8 @@ class OffboardControl(Node):
             # Create and publish TrajectorySetpoint message with NaN values for position and acceleration
             trajectory_msg = TrajectorySetpoint()
             trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-            trajectory_msg.velocity[0] = self.velocity.x
-            trajectory_msg.velocity[1] = self.velocity.y
+            trajectory_msg.velocity[0] = self.velocity.y
+            trajectory_msg.velocity[1] = self.velocity.x
             trajectory_msg.velocity[2] = self.velocity.z
             trajectory_msg.position[0] = float('nan')
             trajectory_msg.position[1] = float('nan')
