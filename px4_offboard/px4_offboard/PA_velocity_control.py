@@ -349,7 +349,7 @@ class OffboardControl(Node):
                                   1.0 - 2.0*(quat[0]*quat[0] + quat[1]*quat[1])))
         
         local_lin = torch.zeros_like(lin)
-        local_lin[0] = lin[0] * torch.cos(self.Yaw) + lin[1] * torch.sin(self.Yaw)
+        local_lin[0] = (lin[0] * torch.cos(self.Yaw) + lin[1] * torch.sin(self.Yaw)) * -1.0
         local_lin[1] = -lin[0] * torch.sin(self.Yaw) + lin[1] * torch.cos(self.Yaw)
         local_lin[2] = -lin[2]
 
@@ -564,9 +564,9 @@ class OffboardControl(Node):
         # print("lin_vel:", lin_vel)
         # print("ang_vel:", ang_vel)
         # print("edit_ang_vel:", edit_ang_vel)
-        print("unit_dir:", unit_dir)
-        print("dist_2d:", dist_2d)
-        print("dist_z:", dist_z)
+        # print("unit_dir:", unit_dir)
+        # print("dist_2d:", dist_2d)
+        # print("dist_z:", dist_z)
 
         input_data = torch.cat([
             lin_vel,
@@ -590,10 +590,10 @@ class OffboardControl(Node):
             output = self.PA_inference.predict(input_data)
             model_output = output.clone().clamp(-1.0, 1.0)  # Ensure outputs are in the range [-1, 1]
 
-            # model_output[0, 0] = 0.0
-            # model_output[0, 1] = 0.
-            # model_output[0, 2] = 0.0
-            # model_output[0, 3] = 0.0
+            # model_output[0, 0] = 0.5
+            # model_output[0, 1] = 0.0
+            # model_output[0, 2] = 0.5
+            # model_output[0, 3] = 0.2
 
             
             output[0, 0] = model_output[0, 0] * 6.28  # yaw rate
